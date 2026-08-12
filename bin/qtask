@@ -68,8 +68,9 @@ cmd_status() {
   else
     echo "  ollama    ${c_red}caido${c_off}"
   fi
-  curl -sf --max-time 3 "$OLLAMA/api/ps" 2>/dev/null | python3 -c '
-import json, sys, datetime
+  QWEN_MODEL="${QWEN_MODEL:-qwen35-code:latest}" curl -sf --max-time 3 "$OLLAMA/api/ps" 2>/dev/null | QWEN_MODEL="${QWEN_MODEL:-qwen35-code:latest}" python3 -c '
+import json, os, sys
+want = os.environ["QWEN_MODEL"]
 try: d = json.load(sys.stdin)
 except Exception: sys.exit()
 if not d.get("models"):
@@ -80,6 +81,11 @@ for m in d["models"]:
     print("  modelo    \033[32m%s\033[0m  ctx %s · %.1f GB · %s" % (
         m["name"], m.get("context_length", "?"), m["size_vram"] / 1e9,
         "\033[32mresidente para siempre\033[0m" if forever else "\033[33mexpira " + m.get("expires_at", "?")[:19] + "\033[0m"))
+    # Solo cabe un modelo a la vez: si el residente no es el tuyo, alguien lo
+    # desalojo (la Ollama.app, un `ollama run` suelto...). La proxima tarea
+    # pagaria recarga, o peor, reventaria si ese modelo no cabe en la GPU.
+    if m["name"] != want:
+        print("            \033[33m^ no es el configurado (%s) — corre: qtask warm\033[0m" % want)
 '
   if server_up; then
     echo "  servidor  ${c_grn}arriba${c_off}  $SERVER"
