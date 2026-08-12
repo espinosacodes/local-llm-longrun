@@ -32,7 +32,7 @@ Este repo arregla los cuatro y añade la capa de "long running" encima.
 ## Qué instala
 
 ```
-qw       chat rápido desde la terminal (streaming, acepta stdin)
+qw       chat rápido desde la terminal (streaming, stdin, transcripciones)
 qtask    agente con herramientas: bash, leer/escribir/editar archivos, grep
 ```
 
@@ -82,6 +82,8 @@ qw "por qué falla este regex"         # primer token en ~1s
 cat error.log | qw "qué significa"    # acepta stdin
 qw -c "función Go de debounce"        # solo código, sin explicación
 qw -t "..."                           # muestra el razonamiento
+qw -l                                 # la última respuesta, aunque cerraras la terminal
+qw --log                              # lista las transcripciones guardadas
 
 qtask serve                           # servidor persistente (hazlo una vez)
 qtask "arregla los tests de scraper/" # agente, en el directorio actual
@@ -210,6 +212,21 @@ Por eso el agente incluido lleva `external_directory: deny` y reglas explícitas
 de nombres exactos de archivo. También le quita herramientas que solo gastan
 contexto (`todowrite`, `webfetch`, subagentes). Con menos herramientas y reglas
 más duras, el mismo modelo pasó la tarea a la primera.
+
+### 8. `ollama run` no guarda lo que el modelo te contesta
+
+`~/.ollama/history` guarda **solo tus prompts**. Las respuestas no se guardan en
+ningún sitio. Si el modelo te escribe un README, un workflow o un script y
+cierras la terminal, se perdió: no hay comando para recuperarlo, no está en el
+historial y el scrollback del terminal se recicla en pocas decenas de bloques.
+
+Por eso `qw` escribe cada intercambio en
+`~/.qwen-local/logs/transcripts/YYYY-MM-DD.md`, y `qw -l` te devuelve la última
+respuesta aunque hayas cerrado todo. Las sesiones de `qtask` van a la base de
+datos de opencode, así que también persisten.
+
+Es la clase de detalle que solo descubres el día que necesitas algo que el
+modelo te dio la semana pasada.
 
 ---
 

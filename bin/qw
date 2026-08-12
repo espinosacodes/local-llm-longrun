@@ -6,9 +6,16 @@
 #   qw -c "funcion en Go que haga debounce"      # -c = modo codigo (solo codigo)
 #   qw -t "cuanto es 2+2"                        # -t = con thinking visible
 #   qw -m qwen35b-q2-tools:latest "..."          # otro modelo
+#   qw -l                                        # la ultima respuesta, aunque
+#                                                # hayas cerrado la terminal
+#   qw --log                                     # lista las transcripciones
 #
 # El modelo vive residente en memoria (ver ~/.qwen-local/keeper.sh), asi que
 # la primera palabra sale en ~0.3s, no en 20s.
+#
+# TODO lo que responde el modelo queda en ~/.qwen-local/logs/transcripts/.
+# `ollama run` guarda solo tus prompts: si te escribe un README y cierras la
+# terminal, se perdio. Aqui no.
 
 set -uo pipefail
 
@@ -25,7 +32,17 @@ while [[ $# -gt 0 ]]; do
     -t|--think) THINK=true; shift ;;
     -m|--model) MODEL="$2"; shift 2 ;;
     -s|--system) SYSTEM="$2"; shift 2 ;;
-    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -l|--last)
+      # Recupera la ultima respuesta, aunque hayas cerrado la terminal.
+      LAST=$(ls -t "$HOME/.qwen-local/logs/transcripts"/*.md 2>/dev/null | head -1)
+      [ -n "$LAST" ] || { echo "aun no hay transcripciones" >&2; exit 1; }
+      awk 'BEGIN{RS="\n---\n"} END{print}' "$LAST"
+      exit 0 ;;
+    --log)
+      echo "$HOME/.qwen-local/logs/transcripts"
+      ls -t "$HOME/.qwen-local/logs/transcripts"/*.md 2>/dev/null | head -10
+      exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) break ;;
   esac
 done
@@ -60,11 +77,19 @@ print(json.dumps({
     "keep_alive": -1,
 }))')
 
+# Toda respuesta queda guardada. `ollama run` solo guarda TUS prompts, nunca
+# lo que contesta el modelo: si cierras la terminal, ese README que te acaba de
+# escribir se perdio para siempre. Aqui no.
+TRANSCRIPTS="$HOME/.qwen-local/logs/transcripts"
+mkdir -p "$TRANSCRIPTS"
+TFILE="$TRANSCRIPTS/$(date +%Y-%m-%d).md"
+
 curl -sN --max-time 1800 "$HOST/api/chat" -H 'Content-Type: application/json' -d "$REQ" \
-| THINK="$THINK" python3 -u -c '
-import json, os, sys
+| THINK="$THINK" MODEL="$MODEL" PROMPT="$PROMPT" TFILE="$TFILE" python3 -u -c '
+import json, os, sys, datetime
 show_think = os.environ["THINK"] == "true"
 in_think = False
+answer = []
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -85,8 +110,16 @@ for line in sys.stdin:
         if in_think:
             sys.stderr.write("\033[0m\n\n"); in_think = False
         sys.stdout.write(chunk)
+        answer.append(chunk)
     if d.get("done"):
         ev, ed = d.get("eval_count", 0), d.get("eval_duration", 1) / 1e9
         sys.stdout.write("\n")
         sys.stderr.write("\033[2m[%d tok · %.1f tok/s]\033[0m\n" % (ev, ev / max(ed, 0.001)))
+
+text = "".join(answer).strip()
+if text:
+    with open(os.environ["TFILE"], "a") as f:
+        f.write("\n## %s · %s\n\n**Prompt:**\n\n%s\n\n**Respuesta:**\n\n%s\n\n---\n" % (
+            datetime.datetime.now().strftime("%H:%M:%S"), os.environ["MODEL"],
+            os.environ["PROMPT"].strip(), text))
 '
