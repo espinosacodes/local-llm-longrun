@@ -1,0 +1,4 @@
+*.log
+*.err
+server-pass
+.DS_Store

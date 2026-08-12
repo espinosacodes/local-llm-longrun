@@ -1,0 +1,92 @@
+#!/bin/bash
+# qw — habla con el modelo local desde la terminal, sin overhead de agente.
+#
+#   qw "explicame que hace este regex: ^\d{4}-\d{2}$"
+#   cat error.log | qw "por que falla esto?"
+#   qw -c "funcion en Go que haga debounce"      # -c = modo codigo (solo codigo)
+#   qw -t "cuanto es 2+2"                        # -t = con thinking visible
+#   qw -m qwen35b-q2-tools:latest "..."          # otro modelo
+#
+# El modelo vive residente en memoria (ver ~/.qwen-local/keeper.sh), asi que
+# la primera palabra sale en ~0.3s, no en 20s.
+
+set -uo pipefail
+
+MODEL="${QWEN_MODEL:-qwen35-code:latest}"
+HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+SYSTEM="Eres un asistente tecnico. Responde en el idioma del usuario, directo y sin relleno."
+THINK=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--code)
+      SYSTEM="Eres un generador de codigo. Devuelve UNICAMENTE codigo en un bloque cercado, sin explicacion ni preambulo."
+      shift ;;
+    -t|--think) THINK=true; shift ;;
+    -m|--model) MODEL="$2"; shift 2 ;;
+    -s|--system) SYSTEM="$2"; shift 2 ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+PROMPT="$*"
+# stdin: si te canalizan algo, va como contexto antes de la pregunta
+if [ ! -t 0 ]; then
+  STDIN_DATA="$(cat)"
+  if [ -n "$STDIN_DATA" ]; then
+    PROMPT="${PROMPT}
+
+--- entrada ---
+${STDIN_DATA}"
+  fi
+fi
+
+if [ -z "${PROMPT// }" ]; then
+  echo "uso: qw [-c|-t|-m MODEL] \"tu pregunta\"   (o pipe por stdin)" >&2
+  exit 1
+fi
+
+REQ=$(MODEL="$MODEL" SYSTEM="$SYSTEM" PROMPT="$PROMPT" THINK="$THINK" python3 -c '
+import json, os
+print(json.dumps({
+    "model": os.environ["MODEL"],
+    "messages": [
+        {"role": "system", "content": os.environ["SYSTEM"]},
+        {"role": "user", "content": os.environ["PROMPT"]},
+    ],
+    "stream": True,
+    "think": os.environ["THINK"] == "true",
+    "keep_alive": -1,
+}))')
+
+curl -sN --max-time 1800 "$HOST/api/chat" -H 'Content-Type: application/json' -d "$REQ" \
+| THINK="$THINK" python3 -u -c '
+import json, os, sys
+show_think = os.environ["THINK"] == "true"
+in_think = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if "error" in d:
+        sys.stderr.write("\nerror: %s\n" % d["error"]); sys.exit(1)
+    msg = d.get("message", {})
+    if show_think and msg.get("thinking"):
+        if not in_think:
+            sys.stderr.write("\033[2m[pensando] "); in_think = True
+        sys.stderr.write(msg["thinking"])
+    chunk = msg.get("content") or ""
+    if chunk:
+        if in_think:
+            sys.stderr.write("\033[0m\n\n"); in_think = False
+        sys.stdout.write(chunk)
+    if d.get("done"):
+        ev, ed = d.get("eval_count", 0), d.get("eval_duration", 1) / 1e9
+        sys.stdout.write("\n")
+        sys.stderr.write("\033[2m[%d tok · %.1f tok/s]\033[0m\n" % (ev, ev / max(ed, 0.001)))
+'

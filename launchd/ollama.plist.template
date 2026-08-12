@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.ollama.ollama</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__OLLAMA_BIN__</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- -1 = el modelo nunca se descarga de memoria. Esto es el "long running". -->
+        <key>OLLAMA_KEEP_ALIVE</key>
+        <string>-1</string>
+        <!-- Un solo modelo residente: si cargas dos, uno desaloja al otro. -->
+        <key>OLLAMA_MAX_LOADED_MODELS</key>
+        <string>1</string>
+        <!-- 1 slot: todo el contexto para una peticion y menos buffers en GPU.
+             Con N slots, ollama parte num_ctx entre ellos. -->
+        <key>OLLAMA_NUM_PARALLEL</key>
+        <string>1</string>
+        <key>OLLAMA_FLASH_ATTENTION</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

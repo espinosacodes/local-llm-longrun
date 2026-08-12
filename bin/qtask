@@ -1,0 +1,244 @@
+#!/bin/bash
+# qtask — corre tareas de agente contra el modelo LOCAL, con servidor persistente
+#         y reintentos que conservan el contexto de la sesion.
+#
+#   qtask status                     estado del modelo + servidor
+#   qtask doctor                     diagnostica y repara (runner zombi, OOM de GPU)
+#   qtask warm | unload              carga / libera los ~13 GB del modelo
+#   qtask serve | stop | logs        servidor opencode persistente (puerto 4097)
+#   qtask run "<tarea>"              tarea nueva (reintenta hasta 3 veces)
+#   qtask cont "<seguimiento>"       continua la ultima sesion de este directorio
+#   qtask tui                        abre la TUI ya apuntando al modelo local
+#   qtask web                        abre la interfaz web
+#   qtask queue <archivo>            cola de tareas: una por linea, reanudable
+#   qtask sessions                   lista sesiones
+#
+# Variables: QWEN_MODEL (default qwen35-code:latest), QTASK_RETRIES (3),
+#            QTASK_PORT (4097), QTASK_AGENT (local)
+
+set -uo pipefail
+
+MODEL_REF="local-ollama/${QWEN_MODEL:-qwen35-code:latest}"
+OLLAMA="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+PORT="${QTASK_PORT:-4097}"
+SERVER="http://127.0.0.1:$PORT"
+RETRIES="${QTASK_RETRIES:-3}"
+AGENT="${QTASK_AGENT:-local}"
+STATE="$HOME/.qwen-local"
+PLIST="$HOME/Library/LaunchAgents/local.opencode.server.plist"
+PASSFILE="$STATE/server-pass"
+mkdir -p "$STATE/logs"
+
+# El servidor puede ejecutar bash arbitrario, asi que va con basic-auth aunque
+# solo escuche en 127.0.0.1 (protege contra otras apps locales y DNS rebinding).
+if [ ! -s "$PASSFILE" ]; then
+  ( umask 077; head -c 32 /dev/urandom | shasum -a 256 | cut -c1-32 > "$PASSFILE" )
+fi
+PASS="$(cat "$PASSFILE")"
+USER_="opencode"
+
+c_dim=$'\033[2m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_off=$'\033[0m'
+say() { echo "${c_dim}qtask${c_off} $*"; }
+
+server_up() { curl -sf --max-time 2 -u "$USER_:$PASS" "$SERVER/config" >/dev/null 2>&1; }
+
+model_loaded() {
+  curl -sf --max-time 3 "$OLLAMA/api/ps" 2>/dev/null \
+    | grep -q "\"${QWEN_MODEL:-qwen35-code:latest}\""
+}
+
+ensure_model() {
+  if ! model_loaded; then
+    say "modelo frio, precargando…"
+    bash "$STATE/keeper.sh"
+  fi
+}
+
+# Ejecuta opencode; usa el servidor persistente si esta arriba.
+oc_run() {
+  local extra=()
+  server_up && extra+=(--attach "$SERVER" --dir "$PWD" -u "$USER_" -p "$PASS")
+  opencode run --auto --agent "$AGENT" -m "$MODEL_REF" "${extra[@]}" "$@"
+}
+
+cmd_status() {
+  echo
+  if curl -sf --max-time 3 "$OLLAMA/api/version" >/dev/null 2>&1; then
+    echo "  ollama    ${c_grn}arriba${c_off}  $OLLAMA"
+  else
+    echo "  ollama    ${c_red}caido${c_off}"
+  fi
+  curl -sf --max-time 3 "$OLLAMA/api/ps" 2>/dev/null | python3 -c '
+import json, sys, datetime
+try: d = json.load(sys.stdin)
+except Exception: sys.exit()
+if not d.get("models"):
+    print("  modelo    \033[33mno residente\033[0m (corre: qtask warm)"); sys.exit()
+for m in d["models"]:
+    exp = m.get("expires_at", "")[:4]
+    forever = exp.isdigit() and int(exp) > 2100
+    print("  modelo    \033[32m%s\033[0m  ctx %s · %.1f GB · %s" % (
+        m["name"], m.get("context_length", "?"), m["size_vram"] / 1e9,
+        "\033[32mresidente para siempre\033[0m" if forever else "\033[33mexpira " + m.get("expires_at", "?")[:19] + "\033[0m"))
+'
+  if server_up; then
+    echo "  servidor  ${c_grn}arriba${c_off}  $SERVER"
+  else
+    echo "  servidor  ${c_yel}abajo${c_off}   (corre: qtask serve)"
+  fi
+  echo "  agente    $AGENT · $MODEL_REF"
+  echo
+}
+
+cmd_warm() { ensure_model; cmd_status; }
+
+cmd_unload() {
+  # Libera los ~13 GB sin apagar ollama (para compilar, editar video, etc.)
+  curl -sf --max-time 10 "$OLLAMA/api/chat" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${QWEN_MODEL:-qwen35-code:latest}\",\"messages\":[],\"keep_alive\":0}" >/dev/null
+  say "modelo descargado de memoria (vuelve con: qtask warm)"
+}
+
+cmd_doctor() {
+  cmd_status
+  say "probando generacion real…"
+  local out; out=$(curl -sf --max-time 120 "$OLLAMA/api/chat" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${QWEN_MODEL:-qwen35-code:latest}\",\"messages\":[{\"role\":\"user\",\"content\":\"di OK\"}],\"stream\":false,\"think\":false,\"options\":{\"num_predict\":8}}")
+  if echo "$out" | grep -q '"eval_count":[1-9]'; then
+    say "${c_grn}genera bien${c_off}"
+  else
+    say "${c_red}respuesta vacia — runner zombi${c_off}; reparando"
+    bash "$STATE/keeper.sh"
+    tail -3 "$STATE/logs/keeper.log"
+    echo
+    say "si persiste, la causa suele ser memoria de GPU. Ultimas lineas de ollama:"
+    grep -iE "OutOfMemory|failed to decode|Compute error" ~/.ollama/logs/server.log 2>/dev/null | tail -3
+  fi
+}
+
+cmd_serve() {
+  cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>local.opencode.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$(command -v opencode)</string>
+        <string>serve</string>
+        <string>--port</string><string>$PORT</string>
+        <string>--hostname</string><string>127.0.0.1</string>
+        <string>--print-logs</string>
+        <string>--log-level</string><string>INFO</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>WorkingDirectory</key><string>$HOME</string>
+    <key>StandardOutPath</key><string>$STATE/logs/opencode-server.log</string>
+    <key>StandardErrorPath</key><string>$STATE/logs/opencode-server.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$PATH</string>
+        <key>OPENCODE_SERVER_USERNAME</key><string>$USER_</string>
+        <key>OPENCODE_SERVER_PASSWORD</key><string>$PASS</string>
+    </dict>
+</dict>
+</plist>
+PL
+  chmod 600 "$PLIST"
+  launchctl bootout "gui/$(id -u)/local.opencode.server" 2>/dev/null
+  # launchd a veces devuelve I/O error si el bootout anterior aun se esta
+  # asentando; reintentar un par de veces lo resuelve.
+  for i in 1 2 3; do
+    sleep 2
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+    [ "$i" = 3 ] && { echo "no pude cargar el LaunchAgent" >&2; exit 1; }
+  done
+  say "esperando al servidor…"
+  for _ in $(seq 1 30); do server_up && break; sleep 1; done
+  ensure_model
+  cmd_status
+}
+
+cmd_stop() {
+  launchctl bootout "gui/$(id -u)/local.opencode.server" 2>/dev/null
+  say "servidor detenido (el modelo sigue residente)"
+}
+
+# --- nucleo: correr una tarea con reintentos que conservan contexto ----------
+run_with_retries() {
+  local mode="$1"; shift          # "new" | "cont"
+  local prompt="$*"
+  ensure_model
+
+  local attempt=1
+  while [ "$attempt" -le "$RETRIES" ]; do
+    local started; started=$(date +%s)
+    say "intento $attempt/$RETRIES · $(date '+%H:%M:%S')"
+
+    if [ "$attempt" -gt 1 ] || [ "$mode" = "cont" ]; then
+      # Reintento: --continue reengancha la MISMA sesion, asi que el modelo
+      # conserva todo lo que ya hizo en vez de empezar de cero.
+      oc_run --continue "$prompt"
+    else
+      oc_run --title "$(echo "$prompt" | cut -c1-60)" "$prompt"
+    fi
+    local rc=$?
+
+    local secs=$(( $(date +%s) - started ))
+    if [ "$rc" -eq 0 ]; then
+      say "${c_grn}listo${c_off} en ${secs}s"
+      echo "$(date '+%F %T') OK ${secs}s :: $prompt" >> "$STATE/logs/qtask.log"
+      return 0
+    fi
+
+    say "${c_red}fallo${c_off} (rc=$rc) tras ${secs}s"
+    echo "$(date '+%F %T') FAIL rc=$rc ${secs}s :: $prompt" >> "$STATE/logs/qtask.log"
+    # Si murio por el modelo caido, revivelo antes de reintentar.
+    ensure_model
+    attempt=$(( attempt + 1 ))
+    [ "$attempt" -le "$RETRIES" ] && { say "reintentando en 5s…"; sleep 5; }
+    prompt="Continua donde te quedaste. La ejecucion anterior se interrumpio; revisa el estado real de los archivos antes de seguir."
+  done
+
+  say "${c_red}se agotaron los $RETRIES intentos${c_off}"
+  return 1
+}
+
+cmd_queue() {
+  local file="$1"
+  [ -f "$file" ] || { echo "no existe: $file" >&2; exit 1; }
+  local done_file="$STATE/queue-$(echo "$PWD$file" | shasum | cut -c1-12).done"
+  touch "$done_file"
+  local n=0 ok=0
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    n=$(( n + 1 ))
+    if grep -Fxq "$line" "$done_file"; then say "${c_dim}[$n] ya hecha, salto${c_off}"; continue; fi
+    echo; say "${c_yel}[$n] $line${c_off}"
+    if run_with_retries new "$line"; then
+      echo "$line" >> "$done_file"; ok=$(( ok + 1 ))
+    else
+      say "corto la cola en la tarea $n"; break
+    fi
+  done < "$file"
+  say "cola: $ok/$n completadas · progreso en $done_file"
+}
+
+case "${1:-status}" in
+  status)   cmd_status ;;
+  warm)     cmd_warm ;;
+  unload)   cmd_unload ;;
+  doctor)   cmd_doctor ;;
+  serve)    cmd_serve ;;
+  stop)     cmd_stop ;;
+  logs)     tail -f "$STATE/logs/opencode-server.log" ;;
+  sessions) opencode session list ;;
+  tui)      ensure_model; shift; exec opencode --agent "$AGENT" -m "$MODEL_REF" "$@" ;;
+  web)      ensure_model; exec opencode web ;;
+  run)      shift; run_with_retries new "$@" ;;
+  cont)     shift; run_with_retries cont "$@" ;;
+  -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)        run_with_retries new "$@" ;;   # qtask "haz X" tambien funciona
+esac

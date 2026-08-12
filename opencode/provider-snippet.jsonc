@@ -1,0 +1,35 @@
+// Pega esto dentro de "provider" en ~/.config/opencode/opencode.jsonc
+// (install.sh lo hace por ti si el archivo no existe todavia).
+//
+// Nota: usamos el endpoint compatible con OpenAI de ollama (/v1). Funciona con
+// tool-calling y con el streaming de "reasoning" de los modelos con thinking.
+{
+  "local-ollama": {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": "Ollama (local)",
+    "options": {
+      "baseURL": "http://localhost:11434/v1",
+      "apiKey": "ollama" // ollama lo ignora, pero el SDK exige que exista
+    },
+    "models": {
+      "qwen35-code:latest": {
+        "name": "Qwen35 Code (local, 40K)",
+        "tool_call": true,
+        "reasoning": true,
+        // Este limite tiene que coincidir con el num_ctx del Modelfile.
+        // Si pones mas, opencode enviara prompts que el modelo trunca en silencio.
+        "limit": {
+          "context": 40960,
+          "output": 8192
+        },
+        "options": {
+          "temperature": 0.15,
+          "topP": 0.8
+        }
+      }
+      // No expongas aqui un quant que no quepa en tu GPU: si revienta, ollama
+      // se queda devolviendo respuestas VACIAS con HTTP 200 y parece que el
+      // agente "no hace nada". Ver la seccion de diagnostico del README.
+    }
+  }
+}
