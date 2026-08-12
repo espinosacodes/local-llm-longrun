@@ -4,7 +4,7 @@ Convierte un modelo local de ollama en un agente de programación que se siente
 como Claude Code: **residente en memoria**, con herramientas de CLI, sesiones
 persistentes y tareas largas que sobreviven a que algo se muera y se recree.
 
-Probado en un MacBook Pro M4 Pro de 24 GB con un Qwen3.5 de 35B (MoE, A3B) a 2 bits.
+Probado en un MacBook Pro M4 Pro de 24 GB con un Qwen3.5 de 35B (MoE, A3B) a 2 bits (IQ2_M, contexto 16K).
 
 ---
 
@@ -175,7 +175,16 @@ Aquí manda solo el LaunchAgent, en `127.0.0.1`. Compruébalo:
 
 ```bash
 lsof -nP -iTCP:11434 -sTCP:LISTEN   # tiene que salir UNA linea
+pgrep -fl "llama-server"            # tiene que salir UN runner
 ```
+
+Y lo peor de tener dos servidores: **cada uno carga su propia copia del
+modelo**. Dos runners de 12 GB en 24 GB de RAM mandan el sistema a swap, Metal
+se queda sin memoria de GPU y el runner muere en cada `decode` — el zombi del
+punto 2, pero permanente hasta que matas el duplicado. En macOS la Ollama.app
+se relanza sola (vive en la barra de menú): **ciérrala desde ahí y no la
+reabras**; el keeper también detecta y mata los runners duplicados en cada
+pasada, pero es un parche, no una cura.
 
 ### 5. Servidor persistente: 60s → 14s
 

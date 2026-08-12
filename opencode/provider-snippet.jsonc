@@ -13,13 +13,13 @@
     },
     "models": {
       "qwen35-code:latest": {
-        "name": "Qwen35 Code (local, 40K)",
+        "name": "Qwen35 Code (local, 16K)",
         "tool_call": true,
         "reasoning": true,
-        // Este limite tiene que coincidir con el num_ctx del Modelfile.
+        // Este limite tiene que coincidir con el num_ctx del Modelfile (16K en hardware de 24 GB).
         // Si pones mas, opencode enviara prompts que el modelo trunca en silencio.
         "limit": {
-          "context": 40960,
+          "context": 16384,
           "output": 8192
         },
         "options": {

@@ -31,6 +31,23 @@ generates() {
     2>/dev/null | grep -q '"eval_count":[1-9]'
 }
 
+# Servidores ollama duplicados: la Ollama.app levanta el suyo ademas del de
+# launchd, y cada uno carga SU PROPIA copia del modelo (2 x 12 GB en 24 GB de
+# RAM). El sistema entra en swap, Metal se queda sin memoria de GPU y el runner
+# muere en cada decode. Es la causa #1 de zombis recurrentes.
+SERVERS=$(pgrep -f "ollama serve" | wc -l | tr -d ' ')
+if [ "$SERVERS" -gt 1 ]; then
+  log "AVISO: $SERVERS servidores ollama activos (probable Ollama.app). Cierrala desde la barra de menu; dejo solo el mas antiguo."
+  # el mas nuevo suele ser el intruso de la app
+  pgrep -f "ollama serve" | tail -n +2 | while read -r pid; do kill "$pid" 2>/dev/null; done
+  sleep 2
+fi
+RUNNERS=$(pgrep -f "llama-server" | wc -l | tr -d ' ')
+if [ "$RUNNERS" -gt 1 ]; then
+  log "AVISO: $RUNNERS runners llama-server (modelo cargado por duplicado) — matando extras"
+  pkill -9 -f llama-server 2>/dev/null; sleep 3
+fi
+
 if ! curl -sf --max-time 5 "$HOST/api/ps" 2>/dev/null | grep -q "\"$MODEL\""; then
   log "modelo frio, precargando"
   preload

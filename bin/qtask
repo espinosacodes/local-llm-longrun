@@ -47,9 +47,21 @@ model_loaded() {
     | grep -q "\"${QWEN_MODEL:-qwen35-code:latest}\""
 }
 
+# ¿el modelo GENERA de verdad? Estar cargado no basta: tras un OOM de GPU el
+# runner queda zombi y responde vacio al instante (eval_count 0) con HTTP 200.
+model_generates() {
+  curl -sf --max-time 60 "$OLLAMA/api/chat" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${QWEN_MODEL:-qwen35-code:latest}\",\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}],\"stream\":false,\"think\":false,\"keep_alive\":-1,\"options\":{\"num_predict\":4}}" \
+    2>/dev/null | grep -q '"eval_count":[1-9]'
+}
+
 ensure_model() {
   if ! model_loaded; then
     say "modelo frio, precargando…"
+    bash "$STATE/keeper.sh"
+  elif ! model_generates; then
+    # cargado pero zombi: keeper.sh mata el runner y lo recrea
+    say "${c_yel}modelo no responde (zombi), reparando…${c_off}"
     bash "$STATE/keeper.sh"
   fi
 }
@@ -58,7 +70,12 @@ ensure_model() {
 oc_run() {
   local extra=()
   server_up && extra+=(--attach "$SERVER" --dir "$PWD" -u "$USER_" -p "$PASS")
-  opencode run --auto --agent "$AGENT" -m "$MODEL_REF" "${extra[@]}" "$@"
+  # ${extra[@]+...}: el bash 3.2 de macOS trata una array vacia bajo `set -u`
+  # como variable sin definir y aborta. Sin servidor, extra esta vacia.
+  # stdin desde /dev/null: si no, opencode se traga el stdin del bucle
+  # `while read` de cmd_queue y la cola se salta las tareas restantes.
+  opencode run --auto --agent "$AGENT" -m "$MODEL_REF" \
+    ${extra[@]+"${extra[@]}"} "$@" </dev/null
 }
 
 cmd_status() {
@@ -193,6 +210,12 @@ run_with_retries() {
     local rc=$?
 
     local secs=$(( $(date +%s) - started ))
+    # rc 0 + duracion irrisoria = el runner devolvio vacio (zombi por OOM):
+    # opencode sale al instante sin llamar herramientas y aparenta exito.
+    if [ "$rc" -eq 0 ] && [ "$secs" -lt 3 ] && ! model_generates; then
+      say "${c_yel}salida vacia en ${secs}s (modelo zombi), no cuenta${c_off}"
+      rc=99
+    fi
     if [ "$rc" -eq 0 ]; then
       say "${c_grn}listo${c_off} en ${secs}s"
       echo "$(date '+%F %T') OK ${secs}s :: $prompt" >> "$STATE/logs/qtask.log"
@@ -214,12 +237,20 @@ run_with_retries() {
 
 cmd_queue() {
   local file="$1"
-  [ -f "$file" ] || { echo "no existe: $file" >&2; exit 1; }
+  [ -f "$file" ] || { echo "no existe: $file" >&2; return 1; }
+  # Una tarea por linea. Se ignoran lineas en blanco y las que empiezan con #.
+  # No es un formato de plan/markdown: si le pasas un .md con prosa, cada
+  # parrafo se tomaria como una tarea. Usa lineas cortas e imperativas.
+  local total; total=$(grep -cvE '^[[:space:]]*($|#)' "$file")
+  say "cola: $total tareas en $file"
   local done_file="$STATE/queue-$(echo "$PWD$file" | shasum | cut -c1-12).done"
   touch "$done_file"
   local n=0 ok=0
-  while IFS= read -r line; do
-    case "$line" in ''|'#'*) continue ;; esac
+  # FD 3 (no stdin): asi lo que ejecute cada tarea no puede drenar la cola.
+  while IFS= read -r line <&3; do
+    # saltar lineas en blanco (aunque tengan solo espacios) y comentarios
+    [ -z "${line//[[:space:]]/}" ] && continue
+    case "$line" in \#*) continue ;; esac
     n=$(( n + 1 ))
     if grep -Fxq "$line" "$done_file"; then say "${c_dim}[$n] ya hecha, salto${c_off}"; continue; fi
     echo; say "${c_yel}[$n] $line${c_off}"
@@ -228,7 +259,7 @@ cmd_queue() {
     else
       say "corto la cola en la tarea $n"; break
     fi
-  done < "$file"
+  done 3< "$file"
   say "cola: $ok/$n completadas · progreso en $done_file"
 }
 
@@ -245,6 +276,7 @@ case "${1:-status}" in
   web)      ensure_model; exec opencode web ;;
   run)      shift; run_with_retries new "$@" ;;
   cont)     shift; run_with_retries cont "$@" ;;
+  queue)    shift; [ -n "${1:-}" ] || { echo "uso: qtask queue <archivo>" >&2; exit 1; }; cmd_queue "$1" ;;
   -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)        run_with_retries new "$@" ;;   # qtask "haz X" tambien funciona
 esac
