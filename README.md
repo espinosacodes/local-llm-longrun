@@ -1,61 +1,108 @@
 # local-llm-longrun
 
-Convierte un modelo local de ollama en un agente de programación que se siente
-como Claude Code: **residente en memoria**, con herramientas de CLI, sesiones
-persistentes y tareas largas que sobreviven a que algo se muera y se recree.
+Turn a local ollama model into a coding agent that feels like Claude Code:
+**resident in memory**, with CLI tools, persistent sessions, and long-running
+tasks that survive a crash and get recreated.
 
-Probado en un MacBook Pro M4 Pro de 24 GB con un Qwen3.5 de 35B (MoE, A3B) a 2 bits (IQ2_M, contexto 16K).
+Tested on a MacBook Pro (M4 Pro, 24 GB) running a 35B Qwen3.5 MoE (A3B) at 2-bit
+(IQ2_M, 16K context).
+
+> **Why this repo exists.** Everyone tells you *which* local model to run. Almost
+> nobody tells you that the model isn't what makes local agents feel broken — the
+> *runtime* is. This repo documents four silent failure modes I hit building this,
+> and ships the tooling that fixes them.
 
 ---
 
-## El problema
+## The problem
 
-Bajas un modelo, lo pruebas con `ollama run`, va bien. Lo enchufas a un agente
-y la experiencia es horrible: cada tarea tarda un minuto, a veces el agente
-termina al instante sin hacer nada y sin error, y el código que escribe parece
-peor que en el chat.
+You download a model, try it with `ollama run`, it works great. You wire it into
+an agent and the experience falls apart: every task takes a minute, sometimes the
+agent finishes instantly doing nothing (no error), and the code it writes looks
+worse than in the chat.
 
-Casi nada de eso es culpa del modelo. Son cuatro problemas de *runtime* que
-nadie te cuenta:
+Almost none of that is the model's fault. Four runtime problems nobody warns you
+about:
 
-| Síntoma | Causa real |
+| Symptom | Real cause |
 |---|---|
-| La primera petición tarda 20s | El modelo se descarga de memoria a los 5 min (`keep_alive` por defecto) |
-| El agente termina al instante, sin salida ni error | La GPU se quedó sin memoria; **ollama sigue respondiendo HTTP 200 con el cuerpo vacío** |
-| El código sale repetitivo o mal | El modelo trae `presence_penalty` alto, que en código es veneno |
-| Comportamiento errático sin patrón | Tienes **dos servidores de ollama** peleando por el puerto 11434 |
+| First request takes ~20s | The model gets evicted from memory after 5 min (default `keep_alive`) |
+| Agent finishes instantly, no output, no error | GPU ran out of memory; **ollama keeps replying HTTP 200 with an empty body** |
+| Code comes out repetitive or wrong | The model ships with a high `presence_penalty`, which is poison for code |
+| Erratic behavior with no pattern | You have **two ollama servers** fighting over port 11434 |
 
-Este repo arregla los cuatro y añade la capa de "long running" encima.
+This repo fixes all four and adds the "long running" layer on top.
 
 ---
 
-## Qué instala
+## How it works
 
-```
-qw       chat rápido desde la terminal (streaming, stdin, transcripciones)
-qtask    agente con herramientas: bash, leer/escribir/editar archivos, grep
-```
-
-Por debajo:
+Two commands sit on top of a resident ollama model and a persistent opencode
+server:
 
 ```mermaid
-graph LR
-    A[qw] -->|HTTP| O[ollama 127.0.0.1:11434<br/>modelo pinneado en RAM]
-    B[qtask] --> S[opencode serve :4097<br/>launchd KeepAlive]
-    S -->|OpenAI API| O
-    K[keeper cada 5 min] -->|precarga + healthcheck| O
+flowchart LR
+    U["👤 you"]
+    U -->|"quick question"| QW["qw<br/><i>chat, streaming</i>"]
+    U -->|"agent task"| QT["qtask<br/><i>tools + retries</i>"]
+
+    QW -->|"HTTP /api/chat"| OL
+    QT -->|"attach"| SRV["opencode serve :4097<br/><i>launchd · KeepAlive</i>"]
+    SRV -->|"OpenAI-compatible API"| OL["🧠 ollama :11434<br/><i>model pinned in RAM</i>"]
+
+    K["keeper<br/><i>every 5 min</i>"] -.->|"preload + healthcheck<br/>kill duplicate runners"| OL
+
+    QW -.->|"logs every reply"| T["~/.qwen-local/logs/<br/>transcripts/"]
+
+    classDef cmd fill:#2563eb,stroke:#1e40af,color:#fff
+    classDef svc fill:#059669,stroke:#047857,color:#fff
+    classDef bg fill:#f59e0b,stroke:#d97706,color:#fff
+    class QW,QT cmd
+    class OL,SRV svc
+    class K,T bg
 ```
 
-- **ollama** bajo launchd con `OLLAMA_KEEP_ALIVE=-1`: el modelo nunca se descarga.
-- **keeper**: lo precarga al arrancar y detecta el "runner zombi" (ver abajo).
-- **opencode serve** persistente: una tarea pasa de ~60s a ~14s.
-- **qtask**: reintentos que *conservan* la sesión, y colas reanudables.
+- **ollama** under launchd with `OLLAMA_KEEP_ALIVE=-1`: the model never unloads.
+- **keeper**: preloads it at boot and detects the "zombie runner" (below).
+- **opencode serve** persistent: a task drops from ~60s to ~14s.
+- **qtask**: retries that *preserve* the session, and resumable queues.
+
+### The request lifecycle
+
+`qw` talks straight to ollama for speed. `qtask` goes through the persistent
+opencode server so it gets the tool-calling agent loop without paying startup
+cost each time:
+
+```mermaid
+sequenceDiagram
+    participant U as you
+    participant Q as qtask
+    participant S as opencode :4097
+    participant O as ollama :11434
+    participant M as model (RAM)
+
+    U->>Q: qtask "fix the parser"
+    Q->>O: is the model loaded AND generating?
+    alt zombie / cold
+        Q->>M: keeper reloads runner
+    end
+    Q->>S: run task (attach, cwd=$PWD)
+    loop agent loop
+        S->>O: prompt + tool schema
+        O->>M: decode
+        M-->>O: tool call (read / write / bash)
+        O-->>S: execute, feed result back
+    end
+    S-->>Q: done (rc=0)
+    Q->>O: still generating? (guard against silent zombie)
+    Q-->>U: ✅ listo en 14s
+```
 
 ---
 
-## Instalación
+## Install
 
-Requisitos: macOS (Apple Silicon), [ollama](https://ollama.com/download) y
+Requirements: macOS (Apple Silicon), [ollama](https://ollama.com/download), and
 [opencode](https://opencode.ai) (`brew install sst/tap/opencode`).
 
 ```bash
@@ -64,59 +111,59 @@ cd local-llm-longrun
 ./install.sh
 ```
 
-Con otro modelo base:
+With a different base model:
 
 ```bash
 BASE_MODEL=qwen2.5-coder:14b MODEL_NAME=coder NUM_CTX=32768 ./install.sh
 ```
 
-**Elige el quant por lo que cabe, no por lo que suena mejor.** Lee la sección
-del OOM antes de decidir.
+**Pick the quant by what fits, not by what sounds best.** Read the OOM section
+before deciding.
 
 ---
 
-## Uso
+## Usage
 
 ```bash
-qw "por qué falla este regex"         # primer token en ~1s
-cat error.log | qw "qué significa"    # acepta stdin
-qw -c "función Go de debounce"        # solo código, sin explicación
-qw -t "..."                           # muestra el razonamiento
-qw -l                                 # la última respuesta, aunque cerraras la terminal
-qw --log                              # lista las transcripciones guardadas
+qw "why does this regex fail"         # first token in ~1s
+cat error.log | qw "what does this mean"   # reads stdin
+qw -c "Go debounce function"          # code only, no prose
+qw -t "..."                           # show the reasoning
+qw -l                                 # last reply, even after you closed the terminal
+qw --log                              # list saved transcripts
 
-qtask serve                           # servidor persistente (hazlo una vez)
-qtask "arregla los tests de scraper/" # agente, en el directorio actual
-qtask cont "ahora añade un test más"  # sigue la misma sesión
-qtask queue tareas.txt                # cola reanudable, una tarea por línea
-qtask tui                             # TUI interactiva
-qtask web                             # interfaz web
+qtask serve                           # persistent server (do this once)
+qtask "fix the tests in scraper/"     # agent, in the current directory
+qtask cont "now add one more test"    # continue the same session
+qtask queue tasks.txt                 # resumable queue, one task per line
+qtask tui                             # interactive TUI
+qtask web                             # web UI
 
-qtask status                          # ¿cargado? ¿servidor arriba?
-qtask doctor                          # diagnostica y repara
-qtask unload                          # libera los GB cuando necesitas la RAM
+qtask status                          # loaded? server up? right model?
+qtask doctor                          # diagnose and repair
+qtask unload                          # free the GB when you need the RAM
 ```
 
 ---
 
-## Las decisiones que importan
+## The decisions that matter
 
-### 1. `keep_alive: -1` — el modelo tiene que vivir residente
+### 1. `keep_alive: -1` — the model has to stay resident
 
-Por defecto ollama descarga el modelo tras 5 minutos de inactividad. Para un
-agente eso significa pagar 15-45s de carga cada vez que vuelves del café. La
-config lo pinnea para siempre y el keeper lo precarga al arrancar la máquina.
+By default ollama unloads the model after 5 minutes idle. For an agent that means
+paying 15–45s of load time every time you come back from a coffee. The config
+pins it forever and the keeper preloads it at boot.
 
-El precio es honesto: son GB de RAM ocupados todo el rato. Por eso existe
-`qtask unload`, que los libera sin apagar nada.
+The cost is honest: it's GB of RAM held all the time. That's why `qtask unload`
+exists — it frees them without shutting anything down.
 
-### 2. El quant tiene que caber **con margen** (el fallo silencioso)
+### 2. The quant has to fit **with headroom** (the silent failure)
 
-Este es el que te va a costar una tarde.
+This is the one that costs you an afternoon.
 
-Un Mac de 24 GB no te da 24 GB a la GPU: el límite (`iogpu.wired_limit`) ronda
-los 16 GB. Un modelo de 15.9 GB *carga bien*, *responde bien un rato*, y luego,
-con un prompt de agente largo, revienta:
+A 24 GB Mac doesn't give 24 GB to the GPU: the limit (`iogpu.wired_limit`) is
+around 16 GB. A 15.9 GB model *loads fine*, *answers fine for a while*, then with
+a long agent prompt it blows up:
 
 ```
 ggml_metal_synchronize: error: command buffer 0 failed with status 5
@@ -125,166 +172,188 @@ llama_decode: failed to decode, ret = -3
 srv update_slots: decode() failed: Compute error.
 ```
 
-Y aquí viene lo cruel: **después de eso ollama no devuelve un error**. Devuelve
-`200 OK` con el cuerpo vacío, para siempre, hasta que reinicies el runner:
+And here's the cruel part: **after that ollama does not return an error.** It
+returns `200 OK` with an empty body, forever, until you restart the runner:
 
-```json
-{"model":"","message":{"role":"","content":""},"done":false}
+```mermaid
+sequenceDiagram
+    participant A as agent (opencode)
+    participant O as ollama
+    participant M as Metal / GPU
+
+    A->>O: prompt
+    O->>M: decode
+    M--xO: OutOfMemory (status 5)
+    Note over O: runner enters error state
+    O-->>A: 200 OK · {"content":""} · eval_count 0
+    Note over A: "finished" in 2s, wrote nothing.<br/>You debug your agent config.<br/>Your config is fine.
+    A->>O: next prompt
+    O-->>A: 200 OK · empty (still zombie)
 ```
 
-Desde opencode eso se ve como un agente que arranca y termina en 2 segundos sin
-escribir nada. Vas a depurar tu config del agente, que está bien.
+**The rule:** leave ~3 GB of headroom over the weights. On 24 GB, that's a ~13 GB
+model, not 16. Dropping from Q2_K to IQ2_M on the same model cost 3.4 GB and made
+it stable — and IQ2_M is usually *better* per byte than Q2_K.
 
-**La regla:** deja ~3 GB de margen sobre los pesos. En 24 GB, eso es un modelo
-de ~13 GB, no de 16. Bajar de Q2_K a IQ2_M en el mismo modelo costó 3.4 GB y lo
-volvió estable — y IQ2_M suele ser *mejor* por byte que Q2_K.
+Context isn't the problem: the KV cache of a small-embedding MoE is cheap (~0.7 GB
+per 49K tokens). The weights are.
 
-El contexto no es el problema: el KV cache de un MoE con embedding pequeño es
-barato (~0.7 GB por 49K tokens). Los pesos sí.
-
-Si de verdad necesitas el quant grande:
+If you genuinely need the big quant:
 
 ```bash
-sudo sysctl iogpu.wired_limit_mb=20480   # 20 GB a la GPU; no persiste al reiniciar
+sudo sysctl iogpu.wired_limit_mb=20480   # 20 GB to the GPU; not persistent across reboot
 ```
 
-`qtask doctor` detecta este estado, mata el runner y lo recrea.
+`qtask doctor` detects this state, kills the runner and recreates it.
 
-### 3. `presence_penalty 0` para código
+### 3. `presence_penalty 0` for code
 
-Muchos modelos de la comunidad vienen con `presence_penalty` en 1.0-1.5. En
-prosa da variedad. En código penaliza reusar el mismo identificador, el mismo
-import, la misma palabra clave — justo lo que el código *tiene* que hacer.
+Many community models ship with `presence_penalty` at 1.0–1.5. In prose it adds
+variety. In code it penalizes reusing the same identifier, import, keyword —
+exactly what code *has* to do. This repo's `Modelfile` sets it to 0, with
+`temperature 0.15` and `top_p 0.8` so tool-calls come out stable. Check what your
+model ships with before blaming it: `ollama show your-model`.
 
-El `Modelfile` de este repo lo pone a 0, con `temperature 0.15` y `top_p 0.8`
-para que los tool-calls salgan estables. Mira los parámetros con los que viene
-tu modelo antes de culparlo:
+### 4. One ollama server, one runner
+
+On macOS the Ollama.app launches its own `ollama serve` — and on `0.0.0.0:11434`,
+i.e. **exposed to your whole local network**. If you also have the LaunchAgent,
+two processes fight over the port, each with different config. Erratic behavior
+with no pattern.
+
+Worse: **each server loads its own copy of the model.** Two 12 GB runners in 24 GB
+of RAM send the system into swap, Metal runs out of GPU memory, and the runner
+dies on every `decode` — the zombie from #2, but permanent until you kill the
+duplicate.
+
+```mermaid
+flowchart TB
+    APP["Ollama.app<br/><i>relaunches from menu bar</i>"] --> S1["ollama serve #1"]
+    LA["LaunchAgent"] --> S2["ollama serve #2"]
+    S1 --> R1["llama-server<br/>12 GB copy"]
+    S2 --> R2["llama-server<br/>12 GB copy"]
+    R1 & R2 --> MEM["24 GB RAM → 8.7 GB swap<br/>Metal OOM · zombie"]
+
+    classDef bad fill:#dc2626,stroke:#991b1b,color:#fff
+    class MEM bad
+```
+
+Only the LaunchAgent should win, on `127.0.0.1`. Check it:
 
 ```bash
-ollama show tu-modelo
+lsof -nP -iTCP:11434 -sTCP:LISTEN   # must print ONE line
+pgrep -fl "llama-server"            # must print ONE runner
 ```
 
-### 4. Un solo servidor de ollama
+The keeper detects and kills duplicate servers/runners on every pass, but that's
+a patch. The cure is to **quit the Ollama.app from the menu bar and not reopen it.**
 
-En macOS la Ollama.app levanta su propio `ollama serve` — y encima en
-`0.0.0.0:11434`, o sea **expuesto a toda tu red local**. Si además tienes el
-LaunchAgent, hay dos procesos peleando por el puerto: unas peticiones van a uno
-y otras al otro, cada uno con distinta config. Comportamiento errático sin patrón.
+### 5. Persistent server: 60s → 14s
 
-Aquí manda solo el LaunchAgent, en `127.0.0.1`. Compruébalo:
+Each standalone `opencode run` pays runtime startup, config read, plugin load and
+LSP boot. With a persistent `opencode serve` under launchd (`KeepAlive`, self-
+healing), the same task drops from ~60s to ~14s.
 
-```bash
-lsof -nP -iTCP:11434 -sTCP:LISTEN   # tiene que salir UNA linea
-pgrep -fl "llama-server"            # tiene que salir UN runner
+It runs with basic-auth even though it only listens on localhost, because **that
+server executes arbitrary bash**: without a password, any local process — or a
+webpage via DNS rebinding — could drive it. The password is generated into
+`~/.qwen-local/server-pass` with mode 600.
+
+### 6. Retry without losing context
+
+A dumb retry repeats the original prompt and the model redoes work already done
+(or duplicates it). `qtask` retries with `--continue` on **the same session** and
+a different instruction, so a task that dies halfway resumes instead of starting
+over:
+
+```mermaid
+flowchart TB
+    A["qtask run 'task'"] --> B["attempt 1<br/>new session"]
+    B --> C{rc == 0<br/>AND actually generated?}
+    C -->|yes| OK["✅ done · record in .done"]
+    C -->|"empty in <3s<br/>(zombie)"| Z["repair model"]
+    C -->|no| R["ensure_model · wait 5s"]
+    Z --> R
+    R --> D["attempt 2+<br/><b>--continue same session</b><br/>'resume where you left off,<br/>check the real file state first'"]
+    D --> C
+    R -.->|"3 attempts exhausted"| F["❌ stop, report blocker"]
+
+    classDef ok fill:#059669,stroke:#047857,color:#fff
+    classDef bad fill:#dc2626,stroke:#991b1b,color:#fff
+    class OK ok
+    class F bad
 ```
 
-Y lo peor de tener dos servidores: **cada uno carga su propia copia del
-modelo**. Dos runners de 12 GB en 24 GB de RAM mandan el sistema a swap, Metal
-se queda sin memoria de GPU y el runner muere en cada `decode` — el zombi del
-punto 2, pero permanente hasta que matas el duplicado. En macOS la Ollama.app
-se relanza sola (vive en la barra de menú): **ciérrala desde ahí y no la
-reabras**; el keeper también detecta y mata los runners duplicados en cada
-pasada, pero es un parche, no una cura.
+`qtask queue` keeps a `.done` file: cut the queue and relaunch, and it skips what
+already completed. That's what lets a long run survive the process dying and being
+recreated.
 
-### 5. Servidor persistente: 60s → 14s
+### 7. A small model needs hard rules, not a pretty prompt
 
-Cada `opencode run` suelto paga arranque de runtime, lectura de config, carga
-de plugins y arranque de LSP. Con un `opencode serve` persistente bajo launchd
-(`KeepAlive`, revive solo), la misma tarea baja de ~60s a ~14s.
+In testing, the model asked to read `datos.txt`, wrote `data.txt`, failed, and
+then **copied a `data.txt` from `~/Downloads`** to make its own mistake line up.
+It reported "verified" against a file that wasn't the user's.
 
-Va con basic-auth aunque escuche solo en localhost, porque **ese servidor
-ejecuta bash arbitrario**: sin clave, cualquier proceso local — o una web con
-DNS rebinding — podría usarlo. La clave se genera sola en
-`~/.qwen-local/server-pass` con permisos 600.
+So the bundled agent ships with `external_directory: deny` and explicit
+exact-filename rules. It also strips tools that only burn context (`todowrite`,
+`webfetch`, subagents). With fewer tools and harder rules, the same model passed
+the task on the first try.
 
-### 6. Reintentar sin perder el contexto
+### 8. `ollama run` doesn't save what the model tells you
 
-Un reintento tonto repite el prompt original y el modelo rehace trabajo ya
-hecho (o lo duplica). `qtask` reintenta con `--continue` sobre **la misma
-sesión** y con otra instrucción:
-
-> Continúa donde te quedaste. La ejecución anterior se interrumpió; revisa el
-> estado real de los archivos antes de seguir.
-
-`qtask queue` lleva un archivo `.done`: si cortas la cola, al relanzarla salta
-lo ya completado. Eso es lo que hace que una tarea larga sobreviva a que el
-proceso se muera y se recree.
-
-### 7. Un modelo pequeño necesita reglas duras, no un prompt bonito
-
-En las pruebas, el modelo pidió leer `datos.txt`, escribió `data.txt`, falló, y
-entonces **copió un `data.txt` desde `~/Downloads`** para que su propio error
-cuadrara. Reportó "verificado" con la suma de un archivo que no era el del
-usuario.
-
-Por eso el agente incluido lleva `external_directory: deny` y reglas explícitas
-de nombres exactos de archivo. También le quita herramientas que solo gastan
-contexto (`todowrite`, `webfetch`, subagentes). Con menos herramientas y reglas
-más duras, el mismo modelo pasó la tarea a la primera.
-
-### 8. `ollama run` no guarda lo que el modelo te contesta
-
-`~/.ollama/history` guarda **solo tus prompts**. Las respuestas no se guardan en
-ningún sitio. Si el modelo te escribe un README, un workflow o un script y
-cierras la terminal, se perdió: no hay comando para recuperarlo, no está en el
-historial y el scrollback del terminal se recicla en pocas decenas de bloques.
-
-Por eso `qw` escribe cada intercambio en
-`~/.qwen-local/logs/transcripts/YYYY-MM-DD.md`, y `qw -l` te devuelve la última
-respuesta aunque hayas cerrado todo. Las sesiones de `qtask` van a la base de
-datos de opencode, así que también persisten.
-
-Es la clase de detalle que solo descubres el día que necesitas algo que el
-modelo te dio la semana pasada.
+`~/.ollama/history` saves **only your prompts**. Replies aren't stored anywhere.
+If the model writes you a README and you close the terminal, it's gone. So `qw`
+writes every exchange to `~/.qwen-local/logs/transcripts/YYYY-MM-DD.md`, and
+`qw -l` gives you the last reply back. `qtask` sessions live in opencode's database,
+so they persist too.
 
 ---
 
-## Diagnóstico rápido
+## Quick diagnosis
 
 ```bash
 qtask doctor
 ```
 
-| Lo que ves | Qué es |
+| What you see | What it is |
 |---|---|
-| Respuesta vacía, `eval_count: 0`, HTTP 200 | OOM de GPU. Quant más pequeño o `iogpu.wired_limit_mb` |
-| El agente termina en 2s sin salida | Lo mismo de arriba, visto desde opencode |
-| Primera petición lenta siempre | El keeper no está corriendo: `launchctl list \| grep qwen` |
-| Respuestas raras e inconsistentes | Dos servidores en 11434: `lsof -nP -iTCP:11434 -sTCP:LISTEN` |
-| Código repetitivo | `ollama show tu-modelo` → mira `presence_penalty` |
+| Empty reply, `eval_count: 0`, HTTP 200 | GPU OOM. Smaller quant or `iogpu.wired_limit_mb` |
+| Agent finishes in 2s with no output | Same thing, seen from opencode |
+| First request always slow | Keeper isn't running: `launchctl list \| grep qwen` |
+| Weird, inconsistent replies | Two servers on 11434: `lsof -nP -iTCP:11434 -sTCP:LISTEN` |
+| Repetitive code | `ollama show your-model` → check `presence_penalty` |
 
-Logs: `~/.ollama/logs/server.log` (busca `OutOfMemory`) y `~/.qwen-local/logs/`.
+Logs: `~/.ollama/logs/server.log` (grep `OutOfMemory`) and `~/.qwen-local/logs/`.
 
 ---
 
-## Números medidos
+## Measured numbers
 
-M4 Pro, 24 GB, Qwen3.5-35B-A3B IQ2_M (13.0 GB residentes, 40K de contexto):
+M4 Pro, 24 GB, Qwen3.5-35B-A3B IQ2_M (12.5 GB resident, 16K context):
 
 | | |
 |---|---|
-| Generación | ~48 tok/s |
-| Prefill, contexto de 13K | ~670 tok/s (~20s) |
-| Carga en frío | ~15s |
-| Tarea de agente simple, con servidor | ~14s |
-| Tarea de agente simple, sin servidor | ~60s |
+| Generation | ~48 tok/s |
+| Prefill, 13K context | ~670 tok/s (~20s) |
+| Cold load | ~15s |
+| Simple agent task, server up | ~14s |
+| Simple agent task, no server | ~60s |
 
-## Qué esperar de la calidad
+## What to expect from quality
 
-Un 35B a 2 bits sirve para tareas mecánicas y acotadas: escribir un script,
-arreglar un test, renombrar cosas, resumir un log. No para diseño ni para
-refactors grandes sin supervisión.
+A 35B at 2-bit is for mechanical, scoped work: write a script, fix a test, rename
+things, summarize a log. Not for design or large refactors without supervision.
 
-Dale trabajo **verificable** (que compile, que pase tests) y revisa el diff.
-El punto de este repo no es que el modelo sea listo: es que el runtime deje de
-sabotearlo.
+Give it **verifiable** work (compiles, passes tests) and review the diff. The
+point of this repo isn't that the model is smart — it's that the runtime stops
+sabotaging it.
 
-## Desinstalar
+## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-## Licencia
+## License
 
 MIT
