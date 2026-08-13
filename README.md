@@ -322,6 +322,7 @@ qtask doctor
 | First request always slow | Keeper isn't running: `launchctl list \| grep qwen` |
 | Weird, inconsistent replies | Two servers on 11434: `lsof -nP -iTCP:11434 -sTCP:LISTEN` |
 | Repetitive code | `ollama show your-model` → check `presence_penalty` |
+| `low max file descriptors` / `Unexpected` on `web`/`tui` | Terminal opened with a low FD limit (Warp ~2560); opencode's watcher exceeds it in a big repo. `qtask` raises its own soft limit before launching; the launchd server plist sets 65536. No sudo needed — the hard limit is unlimited on macOS. |
 
 Logs: `~/.ollama/logs/server.log` (grep `OutOfMemory`) and `~/.qwen-local/logs/`.
 

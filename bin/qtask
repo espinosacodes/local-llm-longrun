@@ -18,6 +18,21 @@
 
 set -uo pipefail
 
+# opencode (sobre todo `web` y `tui`) vigila muchos archivos a la vez y agota
+# los descriptores si la terminal arranca con un limite bajo. Warp abre con
+# ~2560 y revienta con "low max file descriptors". El techo duro en macOS suele
+# ser ilimitado, asi que subimos el limite blando aqui sin sudo. Silencioso si
+# la terminal ya venia holgada.
+raise_fd_limit() {
+  local cur; cur=$(ulimit -Sn)
+  [ "$cur" = "unlimited" ] && return
+  [ "$cur" -ge 61440 ] 2>/dev/null && return
+  for want in 262144 65536 30000 10240; do
+    ulimit -Sn "$want" 2>/dev/null && break
+  done
+}
+raise_fd_limit
+
 MODEL_REF="local-ollama/${QWEN_MODEL:-qwen35-code:latest}"
 OLLAMA="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 PORT="${QTASK_PORT:-4097}"
@@ -110,6 +125,10 @@ for m in d["models"]:
     echo "  servidor  ${c_yel}abajo${c_off}   (corre: qtask serve)"
   fi
   echo "  agente    $AGENT · $MODEL_REF"
+  local fd; fd=$(ulimit -Sn)
+  if [ "$fd" != "unlimited" ] && [ "$fd" -lt 10240 ] 2>/dev/null; then
+    echo "  fd limit  ${c_yel}$fd (bajo — qtask lo sube solo al lanzar)${c_off}"
+  fi
   echo
 }
 
@@ -157,6 +176,14 @@ cmd_serve() {
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <!-- El maxfiles global de launchd es 256; el watcher de opencode necesita
+         mucho mas o muere con "low max file descriptors". -->
+    <key>SoftResourceLimits</key><dict>
+        <key>NumberOfFiles</key><integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key><dict>
+        <key>NumberOfFiles</key><integer>65536</integer>
+    </dict>
     <key>WorkingDirectory</key><string>$HOME</string>
     <key>StandardOutPath</key><string>$STATE/logs/opencode-server.log</string>
     <key>StandardErrorPath</key><string>$STATE/logs/opencode-server.log</string>
