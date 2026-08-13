@@ -12,7 +12,7 @@ set -euo pipefail
 
 BASE_MODEL="${BASE_MODEL:-fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:IQ2_M}"
 MODEL_NAME="${MODEL_NAME:-qwen35-code}"
-NUM_CTX="${NUM_CTX:-16384}"
+NUM_CTX="${NUM_CTX:-65536}"
 STATE="$HOME/.qwen-local"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LA="$HOME/Library/LaunchAgents"

@@ -5,7 +5,7 @@ Turn a local ollama model into a coding agent that feels like Claude Code:
 tasks that survive a crash and get recreated.
 
 Tested on a MacBook Pro (M4 Pro, 24 GB) running a 35B Qwen3.5 MoE (A3B) at 2-bit
-(IQ2_M, 16K context).
+(IQ2_M, 64K context).
 
 > **Why this repo exists.** Everyone tells you *which* local model to run. Almost
 > nobody tells you that the model isn't what makes local agents feel broken — the
@@ -297,7 +297,7 @@ actionable items become tasks (`- [ ]`, `-`, `*`, `1.`), stripped of their marke
 blocks, and prose are skipped. Feed it a plan with no actionable items and it stops
 with a message rather than trying to "run" the prose. This is deliberate: handed a
 plan as a flat list, the model tried to execute table rows and headings, ran out of
-its 16K context, and looped without ever getting past the document.
+context, and looped without ever getting past the document.
 
 Every attempt also has a wall-clock ceiling (`QTASK_MAX_SECS`, default 900s). A run
 that wedges in a loop is killed instead of grinding for hours; when it was attached
@@ -347,7 +347,7 @@ Logs: `~/.ollama/logs/server.log` (grep `OutOfMemory`) and `~/.qwen-local/logs/`
 
 ## Measured numbers
 
-M4 Pro, 24 GB, Qwen3.5-35B-A3B IQ2_M (12.5 GB resident, 16K context):
+M4 Pro, 24 GB, Qwen3.5-35B-A3B IQ2_M (12.5 GB weights, 64K context, ~13.6 GB resident):
 
 | | |
 |---|---|
