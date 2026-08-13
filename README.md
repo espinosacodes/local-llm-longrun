@@ -136,6 +136,7 @@ qtask serve                           # persistent server (do this once)
 qtask "fix the tests in scraper/"     # agent, in the current directory
 qtask cont "now add one more test"    # continue the same session
 qtask queue tasks.txt                 # resumable queue, one task per line
+qtask queue plan.md                   # or a Markdown plan: runs its checklist items
 qtask tui                             # interactive TUI
 qtask web                             # web UI
 
@@ -288,6 +289,21 @@ flowchart TB
 already completed. That's what lets a long run survive the process dying and being
 recreated.
 
+It takes two shapes of input. A **flat list** runs one task per line (blank lines
+and `#` comments ignored). A **Markdown plan** (`.md` with tables, code fences,
+blockquotes, or checklists) is parsed instead of executed line by line: only its
+actionable items become tasks (`- [ ]`, `-`, `*`, `1.`), stripped of their marker;
+`- [x]` items count as already done, and headings, tables, quotes, rules, code
+blocks, and prose are skipped. Feed it a plan with no actionable items and it stops
+with a message rather than trying to "run" the prose. This is deliberate: handed a
+plan as a flat list, the model tried to execute table rows and headings, ran out of
+its 16K context, and looped without ever getting past the document.
+
+Every attempt also has a wall-clock ceiling (`QTASK_MAX_SECS`, default 900s). A run
+that wedges in a loop is killed instead of grinding for hours; when it was attached
+to the persistent server, the server is restarted so the runaway session dies with
+it, not just the client.
+
 ### 7. A small model needs hard rules, not a pretty prompt
 
 In testing, the model asked to read `datos.txt`, wrote `data.txt`, failed, and
@@ -322,6 +338,7 @@ qtask doctor
 | First request always slow | Keeper isn't running: `launchctl list \| grep qwen` |
 | Weird, inconsistent replies | Two servers on 11434: `lsof -nP -iTCP:11434 -sTCP:LISTEN` |
 | Repetitive code | `ollama show your-model` → check `presence_penalty` |
+| A `queue` task runs for many minutes and repeats itself | Out of context, looping. If you fed a `.md` plan, `queue` now parses its checklist instead of the raw lines; `QTASK_MAX_SECS` caps each attempt |
 | `low max file descriptors` / `Unexpected` on `web`/`tui` | Terminal opened with a low FD limit (Warp ~2560); opencode's watcher exceeds it in a big repo. `qtask` raises its own soft limit before launching; the launchd server plist sets 65536. No sudo needed — the hard limit is unlimited on macOS. |
 
 Logs: `~/.ollama/logs/server.log` (grep `OutOfMemory`) and `~/.qwen-local/logs/`.

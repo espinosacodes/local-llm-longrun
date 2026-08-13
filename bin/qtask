@@ -10,11 +10,13 @@
 #   qtask cont "<seguimiento>"       continua la ultima sesion de este directorio
 #   qtask tui                        abre la TUI ya apuntando al modelo local
 #   qtask web                        abre la interfaz web
-#   qtask queue <archivo>            cola de tareas: una por linea, reanudable
+#   qtask queue <archivo>            cola reanudable: lista plana (una tarea por
+#                                    linea) o un plan .md (extrae los items)
 #   qtask sessions [texto]           lista sesiones (fecha/carpeta/titulo)
 #
 # Variables: QWEN_MODEL (default qwen35-code:latest), QTASK_RETRIES (3),
-#            QTASK_PORT (4097), QTASK_AGENT (local)
+#            QTASK_MAX_SECS (900, techo por intento), QTASK_PORT (4097),
+#            QTASK_AGENT (local)
 
 set -uo pipefail
 
@@ -38,6 +40,11 @@ OLLAMA="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 PORT="${QTASK_PORT:-4097}"
 SERVER="http://127.0.0.1:$PORT"
 RETRIES="${QTASK_RETRIES:-3}"
+# Techo de tiempo por intento. Un modelo local que se queda sin contexto entra
+# en bucle: repite tool-calls sin terminar nunca (en pruebas, un solo `run`
+# corrio 2.4 h). Sin este techo nada lo corta. 900s cubre tareas legitimas
+# lentas y mata las patologicas.
+MAX_SECS="${QTASK_MAX_SECS:-900}"
 AGENT="${QTASK_AGENT:-local}"
 STATE="$HOME/.qwen-local"
 PLIST="$HOME/Library/LaunchAgents/local.opencode.server.plist"
@@ -91,6 +98,36 @@ oc_run() {
   # `while read` de cmd_queue y la cola se salta las tareas restantes.
   opencode run --auto --agent "$AGENT" -m "$MODEL_REF" \
     ${extra[@]+"${extra[@]}"} "$@" </dev/null
+}
+
+# Reinicia el servidor persistente en el sitio. Cuando un intento se cuelga
+# estando ADJUNTO al servidor, matar el cliente no basta: el trabajo sigue en
+# el servidor. Esto tumba la sesion desbocada y deja el servidor limpio.
+server_bounce() {
+  launchctl kickstart -k "gui/$(id -u)/local.opencode.server" 2>/dev/null || return
+  for _ in $(seq 1 30); do server_up && break; sleep 1; done
+}
+
+# Corre "$@" con un techo de tiempo (MAX_SECS). Si se pasa, mata el arbol de
+# procesos y devuelve 124 (como `timeout`, que macOS no trae). Un vigia en
+# segundo plano marca un flag y manda TERM y luego KILL.
+run_bounded() {
+  local flag; flag="$STATE/.timeout.$$"
+  rm -f "$flag"
+  "$@" &
+  local pid=$!
+  ( sleep "$MAX_SECS"
+    kill -0 "$pid" 2>/dev/null || exit
+    : > "$flag"
+    pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null
+    sleep 3
+    pkill -KILL -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
+  ) &
+  local wd=$!
+  wait "$pid"; local rc=$?
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+  if [ -f "$flag" ]; then rm -f "$flag"; return 124; fi
+  return "$rc"
 }
 
 cmd_status() {
@@ -265,13 +302,20 @@ run_with_retries() {
     if [ "$attempt" -gt 1 ] || [ "$mode" = "cont" ]; then
       # Reintento: --continue reengancha la MISMA sesion, asi que el modelo
       # conserva todo lo que ya hizo en vez de empezar de cero.
-      oc_run --continue "$prompt"
+      run_bounded oc_run --continue "$prompt"
     else
-      oc_run --title "$(echo "$prompt" | cut -c1-60)" "$prompt"
+      run_bounded oc_run --title "$(echo "$prompt" | cut -c1-60)" "$prompt"
     fi
     local rc=$?
 
     local secs=$(( $(date +%s) - started ))
+    # rc 124 = paso el techo de tiempo: el modelo entro en bucle (tipico al
+    # quedarse sin contexto). Adjunto al servidor, hay que reiniciarlo para
+    # matar la sesion desbocada, no solo el cliente.
+    if [ "$rc" -eq 124 ]; then
+      say "${c_red}colgado >${MAX_SECS}s${c_off} (probable bucle por falta de contexto), cortado"
+      server_up && { say "reiniciando servidor para tumbar la sesion desbocada…"; server_bounce; }
+    fi
     # rc 0 + duracion irrisoria = el runner devolvio vacio (zombi por OOM):
     # opencode sale al instante sin llamar herramientas y aparenta exito.
     if [ "$rc" -eq 0 ] && [ "$secs" -lt 3 ] && ! model_generates; then
@@ -297,22 +341,69 @@ run_with_retries() {
   return 1
 }
 
+# ¿el archivo es un plan en Markdown (y no una lista plana de tareas)?
+# Dispara SOLO con estructura inequivoca de documento: tablas, bloques de
+# codigo, citas o checklists. A proposito NO usa titulos '#': en el formato
+# plano de siempre '#' es un comentario, y confundirlo mandaria una lista
+# legitima al parser de plan y descartaria sus tareas.
+looks_like_markdown() {
+  grep -qE '^[[:space:]]*(>|\||`{3}|~{3})|^[[:space:]]*[-*+][[:space:]]+\[[ xX]\]' "$1"
+}
+
+# Extrae de un plan en Markdown SOLO los items accionables, una tarea por
+# linea, sin el marcador. Ignora titulos, tablas, citas, reglas, bloques ```
+# y arte ASCII. Los checklists ya marcados (- [x]) se saltan.
+extract_plan_items() {
+  awk '
+    { line = $0 }
+    line ~ /^[[:space:]]*(```|~~~)/ { infence = !infence; next }
+    infence { next }
+    { s = line; sub(/^[[:space:]]+/, "", s) }
+    s == "" { next }
+    s ~ /^[-*+][[:space:]]+\[[xX]\]/ { next }                                   # checklist hecho
+    s ~ /^[-*+][[:space:]]+\[[[:space:]]\][[:space:]]+/ {                       # checklist pendiente
+      sub(/^[-*+][[:space:]]+\[[[:space:]]\][[:space:]]+/, "", s); print s; next }
+    s ~ /^[-*+][[:space:]]+/    { sub(/^[-*+][[:space:]]+/, "", s); print s; next }   # vineta
+    s ~ /^[0-9]+[.)][[:space:]]+/ { sub(/^[0-9]+[.)][[:space:]]+/, "", s); print s; next }  # lista ordenada
+    # todo lo demas (titulos, tablas, citas, reglas, prosa, arte) se ignora
+  ' "$1"
+}
+
 cmd_queue() {
   local file="$1"
   [ -f "$file" ] || { echo "no existe: $file" >&2; return 1; }
-  # Una tarea por linea. Se ignoran lineas en blanco y las que empiezan con #.
-  # No es un formato de plan/markdown: si le pasas un .md con prosa, cada
-  # parrafo se tomaria como una tarea. Usa lineas cortas e imperativas.
-  local total; total=$(grep -cvE '^[[:space:]]*($|#)' "$file")
+
+  # Normaliza el archivo a una tarea por linea antes de correr nada.
+  #   - Lista plana: una tarea imperativa por linea (comportamiento de siempre).
+  #   - Plan en Markdown: se extraen SOLO los items accionables (- [ ], -, 1.).
+  # Sin esto, un .md se troceaba por lineas y el agente intentaba "ejecutar"
+  # filas de tabla, titulos y prosa: se quedaba sin contexto (16K) y entraba en
+  # bucle sin pasar del plan. Ver qtask.log si dudas de por que se te colgo.
+  local tasks_file; tasks_file="$STATE/.queue-tasks.$$"
+  if looks_like_markdown "$file"; then
+    extract_plan_items "$file" > "$tasks_file"
+    if [ ! -s "$tasks_file" ]; then
+      rm -f "$tasks_file"
+      echo "qtask: '$file' parece Markdown pero no tiene items accionables." >&2
+      echo "       Escribe los pasos como lista ('- haz X' o '1. haz Y'), o pasa" >&2
+      echo "       un texto plano con una tarea imperativa por linea." >&2
+      return 1
+    fi
+    say "plan en Markdown: extraje $(wc -l < "$tasks_file" | tr -d ' ') tareas accionables (ignore titulos/tablas/prosa)"
+  else
+    # Lista plana: quita blancos y comentarios, deja el resto verbatim.
+    grep -vE '^[[:space:]]*($|#)' "$file" > "$tasks_file"
+  fi
+
+  local total; total=$(wc -l < "$tasks_file" | tr -d ' ')
   say "cola: $total tareas en $file"
   local done_file="$STATE/queue-$(echo "$PWD$file" | shasum | cut -c1-12).done"
   touch "$done_file"
   local n=0 ok=0
   # FD 3 (no stdin): asi lo que ejecute cada tarea no puede drenar la cola.
   while IFS= read -r line <&3; do
-    # saltar lineas en blanco (aunque tengan solo espacios) y comentarios
+    # saltar lineas en blanco (aunque tengan solo espacios)
     [ -z "${line//[[:space:]]/}" ] && continue
-    case "$line" in \#*) continue ;; esac
     n=$(( n + 1 ))
     if grep -Fxq "$line" "$done_file"; then say "${c_dim}[$n] ya hecha, salto${c_off}"; continue; fi
     echo; say "${c_yel}[$n] $line${c_off}"
@@ -321,7 +412,8 @@ cmd_queue() {
     else
       say "corto la cola en la tarea $n"; break
     fi
-  done 3< "$file"
+  done 3< "$tasks_file"
+  rm -f "$tasks_file"
   say "cola: $ok/$n completadas · progreso en $done_file"
 }
 
