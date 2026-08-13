@@ -42,13 +42,13 @@ server:
 
 ```mermaid
 flowchart LR
-    U["👤 you"]
+    U["you"]
     U -->|"quick question"| QW["qw<br/><i>chat, streaming</i>"]
     U -->|"agent task"| QT["qtask<br/><i>tools + retries</i>"]
 
     QW -->|"HTTP /api/chat"| OL
     QT -->|"attach"| SRV["opencode serve :4097<br/><i>launchd · KeepAlive</i>"]
-    SRV -->|"OpenAI-compatible API"| OL["🧠 ollama :11434<br/><i>model pinned in RAM</i>"]
+    SRV -->|"OpenAI-compatible API"| OL["ollama :11434<br/><i>model pinned in RAM</i>"]
 
     K["keeper<br/><i>every 5 min</i>"] -.->|"preload + healthcheck<br/>kill duplicate runners"| OL
 
@@ -95,7 +95,7 @@ sequenceDiagram
     end
     S-->>Q: done (rc=0)
     Q->>O: still generating? (guard against silent zombie)
-    Q-->>U: ✅ listo en 14s
+    Q-->>U: done in 14s
 ```
 
 ---
@@ -270,13 +270,13 @@ over:
 flowchart TB
     A["qtask run 'task'"] --> B["attempt 1<br/>new session"]
     B --> C{rc == 0<br/>AND actually generated?}
-    C -->|yes| OK["✅ done · record in .done"]
+    C -->|yes| OK["done · record in .done"]
     C -->|"empty in <3s<br/>(zombie)"| Z["repair model"]
     C -->|no| R["ensure_model · wait 5s"]
     Z --> R
     R --> D["attempt 2+<br/><b>--continue same session</b><br/>'resume where you left off,<br/>check the real file state first'"]
     D --> C
-    R -.->|"3 attempts exhausted"| F["❌ stop, report blocker"]
+    R -.->|"3 attempts exhausted"| F["stop, report blocker"]
 
     classDef ok fill:#059669,stroke:#047857,color:#fff
     classDef bad fill:#dc2626,stroke:#991b1b,color:#fff
