@@ -11,7 +11,7 @@
 #   qtask tui                        abre la TUI ya apuntando al modelo local
 #   qtask web                        abre la interfaz web
 #   qtask queue <archivo>            cola de tareas: una por linea, reanudable
-#   qtask sessions                   lista sesiones
+#   qtask sessions [texto]           lista sesiones (fecha/carpeta/titulo)
 #
 # Variables: QWEN_MODEL (default qwen35-code:latest), QTASK_RETRIES (3),
 #            QTASK_PORT (4097), QTASK_AGENT (local)
@@ -133,6 +133,41 @@ for m in d["models"]:
 }
 
 cmd_warm() { ensure_model; cmd_status; }
+
+# Lista las sesiones directamente de la base de opencode: fecha, carpeta y
+# titulo. Asi las ubicas aunque el web las agrupe por directorio.
+#   qtask sessions            ultimas 25
+#   qtask sessions <texto>    filtra por carpeta o titulo
+cmd_sessions() {
+  local db="$HOME/.local/share/opencode/opencode.db"
+  [ -f "$db" ] || { opencode session list; return; }
+  local filter="${1:-}"
+  # copia para no chocar con el WAL del servidor vivo
+  local tmp; tmp="$STATE/.sessions.db"
+  cp "$db" "$tmp" 2>/dev/null || { opencode session list; return; }
+  FILTER="$filter" HOME_="$HOME" python3 - "$tmp" <<'PY'
+import sqlite3, os, sys, datetime
+db, flt = sys.argv[1], os.environ.get("FILTER", "").lower()
+home = os.environ["HOME_"]
+con = sqlite3.connect(db)
+rows = con.execute("SELECT time_created, directory, title FROM session ORDER BY time_created DESC").fetchall()
+seen = 0
+print("\n  \033[2mfecha              carpeta / titulo\033[0m")
+for ts, d, title in rows:
+    d = d or ""; title = (title or "").strip().replace("\n", " ")
+    if flt and flt not in d.lower() and flt not in title.lower():
+        continue
+    when = datetime.datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M")
+    short = d.replace(home, "~")
+    print(f"  {when}  \033[36m{short}\033[0m")
+    print(f"                     {title[:70]}")
+    seen += 1
+    if seen >= 25: break
+print(f"\n  {seen} sesiones" + (f" que coinciden con '{flt}'" if flt else " (las 25 mas recientes)"))
+print("  \033[2mabrir una:  cd <carpeta> && qtask tui\033[0m\n")
+PY
+  rm -f "$tmp"
+}
 
 cmd_unload() {
   # Libera los ~13 GB sin apagar ollama (para compilar, editar video, etc.)
@@ -298,9 +333,14 @@ case "${1:-status}" in
   serve)    cmd_serve ;;
   stop)     cmd_stop ;;
   logs)     tail -f "$STATE/logs/opencode-server.log" ;;
-  sessions) opencode session list ;;
+  sessions) shift; cmd_sessions "${1:-}" ;;
   tui)      ensure_model; shift; exec opencode --agent "$AGENT" -m "$MODEL_REF" "$@" ;;
-  web)      ensure_model; exec opencode web ;;
+  web)      ensure_model
+            # opencode agrupa las sesiones por directorio: el web solo muestra
+            # las de la carpeta desde la que lo abres. Si estas en HOME, avisa.
+            [ "$PWD" = "$HOME" ] && say "${c_yel}estas en HOME; para ver las sesiones de un proyecto, abrelo desde su carpeta${c_off}"
+            say "web en: $PWD"
+            exec opencode web ;;
   run)      shift; run_with_retries new "$@" ;;
   cont)     shift; run_with_retries cont "$@" ;;
   queue)    shift; [ -n "${1:-}" ] || { echo "uso: qtask queue <archivo>" >&2; exit 1; }; cmd_queue "$1" ;;
